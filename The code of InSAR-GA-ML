@@ -1,0 +1,495 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import os
+import pandas as pd
+import numpy as np
+import matplotlib
+
+matplotlib.use('Agg')  # 无 GUI 环境下绘图
+import matplotlib.pyplot as plt
+import shap
+import optuna
+from imblearn.over_sampling import SMOTE
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import log_loss, roc_auc_score, f1_score, recall_score, cohen_kappa_score, roc_curve
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
+from catboost import CatBoostClassifier
+from lightgbm import LGBMClassifier
+from deap import base, creator, tools, algorithms
+import random
+
+# ==== 1. 数据加载与预处理 ====
+desktop = r'F:\GASHAP机器学习\训练集'
+DATA_PATH = os.path.join(desktop, '训练集.csv')
+if not os.path.isfile(DATA_PATH):
+    raise FileNotFoundError(f"未找到数据文件：{DATA_PATH}")
+
+df = pd.read_csv(DATA_PATH)
+if 'FID' in df.columns:
+    df.drop(columns=['FID'], inplace=True)
+df.dropna(how='all', inplace=True)
+
+# -9999 替换为均值
+for col in df.select_dtypes(include=[np.number]).columns:
+    mask = df[col] != -9999
+    if mask.any():
+        df.loc[~mask, col] = df.loc[mask, col].mean()
+df.dropna(inplace=True)
+
+X = df.drop(columns=['HL'])
+y = df['HL']
+
+# SMOTE 过采样
+smote = SMOTE(random_state=42)
+X_res, y_res = smote.fit_resample(X, y)
+
+# ==== 2. GA 特征选择 ====
+feature_names = list(X_res.columns)
+n_features = len(feature_names)
+
+
+# GA 目标函数：最小化 RF logloss
+def eval_individual(individual):
+    selected = [feature for gene, feature in zip(individual, feature_names) if gene == 1]
+    if len(selected) == 0:
+        return 9999,
+    X_sel = X_res[selected]
+    # 直接7:3划分训练集测试集
+    X_train, X_test, y_train, y_test = train_test_split(X_sel, y_res, test_size=0.3, stratify=y_res, random_state=42)
+    model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+    model.fit(X_train, y_train)
+    prob = model.predict_proba(X_test)[:, 1]
+    return log_loss(y_test, prob),
+
+
+creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
+creator.create("Individual", list, fitness=creator.FitnessMin)
+
+toolbox = base.Toolbox()
+toolbox.register("attr_bool", random.randint, 0, 1)
+toolbox.register("individual", tools.initRepeat, creator.Individual, toolbox.attr_bool, n_features)
+toolbox.register("population", tools.initRepeat, list, toolbox.individual)
+
+toolbox.register("evaluate", eval_individual)
+toolbox.register("mate", tools.cxTwoPoint)
+toolbox.register("mutate", tools.mutFlipBit, indpb=0.05)
+toolbox.register("select", tools.selTournament, tournsize=3)
+
+pop = toolbox.population(n=50)
+algorithms.eaSimple(pop, toolbox, cxpb=0.5, mutpb=0.2, ngen=15, verbose=False)
+
+best_ind = tools.selBest(pop, 1)[0]
+selected_features = [feature for gene, feature in zip(best_ind, feature_names) if gene == 1]
+print(f"✅ 选择的特征数：{len(selected_features)}")
+X_res = X_res[selected_features]
+
+# ==== 3. 划分训练/测试集（7:3） ====
+X_train, X_test, y_train, y_test = train_test_split(X_res, y_res, test_size=0.3, stratify=y_res, random_state=42)
+
+# ==== 4. 外部验证集 ====
+external_val_path = os.path.join(desktop, '外部验证集.csv')
+external_X, external_y = None, None
+if os.path.isfile(external_val_path):
+    ext_df = pd.read_csv(external_val_path)
+    ext_df = ext_df[selected_features + ['HL']].dropna()
+    external_X = ext_df[selected_features]
+    external_y = ext_df['HL']
+    print(f"✅ 外部验证集加载成功，样本数：{len(external_y)}")
+
+# 输出目录
+OUTPUT_DIR = os.path.join(desktop, 'shap_results')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# ==== 5. 模型调参并训练 ====
+names = ['GBDT', 'CatBoost', 'LightGBM', 'SVC']  # 添加SVC模型
+best_params = {}
+trained = {}
+results = []
+roc_data = []
+
+
+# 定义 Optuna 调参函数
+def optimize_model(name):
+    def objective(trial):
+        if name == 'GBDT':
+            n_estimators = trial.suggest_int('n_estimators', 50, 500)
+            learning_rate = trial.suggest_float('learning_rate', 1e-4, 1e-1, log=True)
+            max_depth = trial.suggest_int('max_depth', 3, 12)
+            model = GradientBoostingClassifier(n_estimators=n_estimators, learning_rate=learning_rate,
+                                               max_depth=max_depth)
+        elif name == 'CatBoost':
+            it = trial.suggest_int('iterations', 50, 500)
+            lr = trial.suggest_float('learning_rate', 1e-4, 1e-1, log=True)
+            depth = trial.suggest_int('depth', 3, 12)
+            model = CatBoostClassifier(iterations=it, learning_rate=lr, depth=depth, verbose=0)
+        elif name == 'LightGBM':
+            it = trial.suggest_int('n_estimators', 50, 500)
+            lr = trial.suggest_float('learning_rate', 1e-4, 1e-1, log=True)
+            nl = trial.suggest_int('num_leaves', 10, 100)
+            model = LGBMClassifier(n_estimators=it, learning_rate=lr, num_leaves=nl, random_state=42)
+        else:  # SVC模型
+            C = trial.suggest_float('C', 1e-3, 1e2, log=True)
+            kernel = trial.suggest_categorical('kernel', ['linear', 'rbf', 'poly', 'sigmoid'])
+            model = SVC(C=C, kernel=kernel, probability=True, random_state=42)
+        model.fit(X_train, y_train)
+        return log_loss(y_test, model.predict_proba(X_test))
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=30, show_progress_bar=False)
+    return study.best_params
+
+
+for n in names:
+    best_params[n] = optimize_model(n)
+
+# 训练基础模型并评估所有数据集
+for n in names:
+    params = best_params[n]
+    if n == 'GBDT':
+        model = GradientBoostingClassifier(**params)
+    elif n == 'CatBoost':
+        model = CatBoostClassifier(verbose=0, **params)
+    elif n == 'LightGBM':
+        model = LGBMClassifier(random_state=42, **params)
+    else:  # SVC模型
+        model = SVC(random_state=42, probability=True, **params)
+
+    model.fit(X_train, y_train)
+    trained[n] = model
+
+    # 评估训练集、测试集
+    datasets = [
+        ('Train', X_train, y_train),
+        ('Test', X_test, y_test)
+    ]
+
+    if external_X is not None:
+        datasets.append(('External', external_X, external_y))
+
+    for dataset_name, X_data, y_data in datasets:
+        prob = model.predict_proba(X_data)[:, 1]
+        ll = log_loss(y_data, model.predict_proba(X_data))
+        auc = roc_auc_score(y_data, prob)
+        f1 = f1_score(y_data, (prob > 0.5).astype(int))
+        rec = recall_score(y_data, (prob > 0.5).astype(int))
+        kap = cohen_kappa_score(y_data, (prob > 0.5).astype(int))
+
+        results.append({
+            'Model': n,
+            'Dataset': dataset_name,
+            'LogLoss': ll,
+            'AUC': auc,
+            'F1': f1,
+            'Recall': rec,
+            'Kappa': kap
+        })
+
+        # 为测试集保存ROC数据
+        if dataset_name == 'Test':
+            fpr, tpr, _ = roc_curve(y_data, prob)
+            roc_data.append((n, fpr, tpr, auc))
+
+# 绘制ROC曲线（只包含RF，不包含RF_final）
+plt.figure(figsize=(8, 6))
+for n, fpr, tpr, auc in roc_data:
+    plt.plot(fpr, tpr, label=f'InSAR-GA-{n} (AUC={auc:.4f})')
+plt.plot([0, 1], [0, 1], '--')
+plt.xlabel('FPR');
+plt.ylabel('TPR');
+plt.title('ROC Curves (Test Set)')
+plt.legend(loc='lower right')
+plt.savefig(os.path.join(OUTPUT_DIR, 'roc_curves.png'))
+plt.close()
+
+# 绘制所有数据集的评价指标比较图
+results_df = pd.DataFrame(results)
+metrics = ['LogLoss', 'AUC', 'F1', 'Recall', 'Kappa']
+
+for metric in metrics:
+    plt.figure(figsize=(12, 8))
+
+    # 为每个模型和数据集创建条形图
+    models = results_df['Model'].unique()
+    datasets = results_df['Dataset'].unique()
+
+    x = np.arange(len(models))
+    width = 0.8 / len(datasets)
+
+    for i, dataset in enumerate(datasets):
+        values = []
+        for model in models:
+            value = results_df[(results_df['Model'] == model) &
+                               (results_df['Dataset'] == dataset)][metric].values
+            values.append(value[0] if len(value) > 0 else 0)
+
+        plt.bar(x + i * width, values, width, label=dataset)
+
+        # 添加数值标签
+        for j, v in enumerate(values):
+            plt.text(x[j] + i * width, v + 0.01 * max(values) if metric != 'LogLoss' else v - 0.01 * max(values),
+                     f'{v:.4f}', ha='center', va='bottom' if metric != 'LogLoss' else 'top',
+                     fontsize=8, rotation=90)
+
+    plt.xlabel('Model')
+    plt.ylabel(metric)
+    plt.title(f'{metric} Comparison Across Datasets')
+    plt.xticks(x + width * (len(datasets) - 1) / 2, models)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, f'{metric.lower()}_comparison.png'))
+    plt.close()
+
+# 保存参数与结果
+pd.DataFrame(best_params).T.to_csv(os.path.join(OUTPUT_DIR, 'all_best_params.csv'))
+pd.DataFrame(results).to_csv(os.path.join(OUTPUT_DIR, 'model_results.csv'), index=False)
+
+# ==== 6. SHAP分析 ====
+import shap
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# 首先定义封装的函数（调整为正方形，左边留足够空间）
+def plot_shap_beeswarm_with_bars(shap_values, X_train, figsize=(20, 16), dpi=300):
+    # 计算SHAP值相关数据
+    mean_shap = np.abs(shap_values).mean(axis=0)
+    feature_names = X_train.columns
+    shap_df = pd.DataFrame({'feature': feature_names, 'mean_shap': mean_shap}).sort_values('mean_shap', ascending=False)
+    sorted_features = shap_df['feature'].values
+    X_sorted = X_train[sorted_features]
+    orig_index = [list(feature_names).index(f) for f in sorted_features]
+    shap_values_sorted = shap_values[:, orig_index]
+
+    mean_shap_sorted = shap_df['mean_shap'].values
+    n_feat = len(sorted_features)
+    mean_shap_percent = mean_shap_sorted / mean_shap_sorted.sum() * 100
+
+    # 创建正方形画布，左边留更多空间
+    fig = plt.figure(figsize=figsize, dpi=dpi)
+    # 调整坐标系位置，左边留更多空间给变量名
+    ax = fig.add_axes([0.25, 0.15, 0.7, 0.75])  # 左边空间从0.25开始
+
+    # 创建共享y轴的第二个x轴（用于条形图）
+    ax_bar = ax.twiny()
+
+    # 设置图层顺序
+    ax_bar.set_zorder(0)
+    ax.set_zorder(1)
+    ax.patch.set_alpha(0)  # 使主坐标系背景透明
+
+    # 计算位置
+    y_pos = np.arange(n_feat)[::-1]
+
+    # 在顶部坐标系绘制条形图
+    xlim_bar = mean_shap_sorted.max() * 1.05
+    ax_bar.barh(y=y_pos, width=mean_shap_sorted, height=0.6, color='lightpink', alpha=0.5, edgecolor='none', zorder=0)
+
+    # 设置条形图坐标轴
+    ax_bar.set_xlim(0, xlim_bar)
+    ax_bar.set_xlabel('Mean (|SHAP| value)', fontsize=30, labelpad=30)
+    ax_bar.tick_params(axis='x', which='major', pad=10, labelsize=25)
+
+    # 在主坐标系绘制蜂群图
+    plt.sca(ax)
+    expl = shap.Explanation(values=shap_values_sorted, data=X_sorted.values, feature_names=list(sorted_features))
+    shap.plots.beeswarm(expl, show=False, plot_size=None)
+
+    # 调节蜂群图右侧颜色轴标签字体大小
+    for child in fig.get_children():
+        if isinstance(child, plt.Axes) and child.get_ylabel() == 'Feature value':
+            child.set_ylabel('Feature value', fontsize=25)
+            child.tick_params(axis='y', labelsize=20)
+            break
+
+    # 设置蜂群图坐标轴
+    max_abs_shap = np.abs(shap_values_sorted).max()
+    ax.set_xlim(-max_abs_shap * 1.5, max_abs_shap * 1.5)
+    ax.set_xlabel('SHAP value (impact on model output)', fontsize=30)
+    ax.tick_params(axis='x', labelsize=25)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(sorted_features, fontsize=25)
+    ax.tick_params(axis='y', length=4, labelsize=25)
+
+    # 添加条形图数值标签
+    for i, (v, p) in enumerate(zip(mean_shap_sorted, mean_shap_percent)):
+        ax_bar.text(x=0.01 * xlim_bar, y=y_pos[i],
+                    s=f"{v:.3f} ({p:.1f}%)",
+                    va='center', ha='left',
+                    fontsize=20, color='black',
+                    bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.2'))
+
+    # 调节横向条形统计图x轴距离顶部的距离
+    ax_bar.spines['top'].set_position(('axes', 1))
+    ax.xaxis.labelpad = 15
+
+    return fig
+
+
+# 然后继续原来的SHAP分析代码
+sample_size = None
+if sample_size and sample_size < len(X_test):
+    sample_X = X_test.sample(sample_size, random_state=42)
+else:
+    sample_X = X_test.copy()
+
+
+# 定义通用依赖图绘制函数
+def plot_dependence_and_heatmap(name, shap_vals, features):
+    if isinstance(shap_vals, np.ndarray) and shap_vals.ndim == 3:
+        shap_vals = shap_vals[:, :, 1]
+    features = features.reset_index(drop=True)
+
+    # 依赖图
+    for feat in features.columns:
+        plt.figure()
+        shap.dependence_plot(feat, shap_vals, features, interaction_index=None, show=False)
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, f"{name.lower()}_shap_dependence_{feat}.png"))
+        plt.close()
+
+    # 热图
+    exp = shap.Explanation(values=shap_vals, data=features.values, feature_names=list(features.columns))
+    plt.figure()
+    shap.plots.heatmap(exp, show=False)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, f"{name.lower()}_shap_heatmap.png"))
+    plt.close()
+
+    # 使用封装的函数绘制带有条形图的SHAP蜂群图
+    try:
+        # 创建图形并保存
+        fig = plot_shap_beeswarm_with_bars(shap_vals, features, figsize=(20, 20), dpi=300)
+        plt.tight_layout()
+        plt.savefig(os.path.join(OUTPUT_DIR, f"{name.lower()}_shap_combined.png"))
+        plt.close()
+
+        print(f"{name}: 成功生成组合SHAP图")
+    except Exception as e:
+        print(f"{name}: 组合SHAP图生成失败 - {e}")
+
+        # 如果组合图失败，回退到原来的单独图表
+        try:
+            # SHAP 条形图
+            plt.figure()
+            shap.summary_plot(shap_vals, features, plot_type="bar", show=False)
+            ax = plt.gca()
+            max_width = max(patch.get_width() for patch in ax.patches)
+            for patch in ax.patches:
+                width = patch.get_width()
+                y = patch.get_y() + patch.get_height() / 2
+                ax.text(width + 0.01 * max_width, y, f'{width:.4f}',
+                        va='center', ha='left', fontsize=8, color='black')
+            ax.set_xlim(right=max_width * 1.5)
+            plt.xlabel("Mean([SHAP Value])")
+            plt.tight_layout()
+            plt.savefig(os.path.join(OUTPUT_DIR, f"{name.lower()}_shap_bar.png"))
+            plt.close()
+
+            # SHAP Beeswarm 图
+            plt.figure()
+            shap.summary_plot(shap_vals, features, plot_type="dot", show=False)
+            plt.tight_layout()
+            plt.savefig(os.path.join(OUTPUT_DIR, f"{name.lower()}_shap_beeswarm.png"))
+            plt.close()
+
+            print(f"{name}: 已生成单独的条形图和蜂群图")
+        except Exception as e2:
+            print(f"{name}: 回退图表生成也失败 - {e2}")
+
+
+# 为每个模型计算SHAP值（只包含RF，不包含RF_final）
+for name, model in trained.items():
+    try:
+        if name in ['GBDT', 'CatBoost', 'LightGBM', 'RF']:
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(sample_X)
+            if isinstance(shap_values, list):
+                shap_values = np.array(shap_values).transpose(1, 2, 0)
+            plot_dependence_and_heatmap(name, shap_values, sample_X)
+        else:
+            explainer = shap.KernelExplainer(model.predict_proba, shap.kmeans(X_train, 10))
+            shap_values = explainer.shap_values(sample_X)
+            plot_dependence_and_heatmap(name, shap_values, sample_X)
+    except Exception as e:
+        print(f"SHAP分析失败 for {name}: {e}")
+
+# ==== 7. 预测部分 ====
+desktop1 = r'F:\GASHAP机器学习\预测集'
+predict_path = os.path.join(desktop1, '预测集.csv')
+
+if not os.path.isfile(predict_path):
+    raise FileNotFoundError(f"未找到预测数据文件：{predict_path}")
+
+# 读取数据
+pred_df = pd.read_csv(predict_path)
+
+# 删除不需要的列（如果存在）
+columns_to_drop = ['Id', 'land', 'Hazards kernel density', 'FID']
+for col in columns_to_drop:
+    if col in pred_df.columns:
+        pred_df = pred_df.drop(columns=[col])
+
+# 删除全为空的行
+pred_df.dropna(how='all', inplace=True)
+
+# 替换 -9999 为 NaN
+for col in pred_df.select_dtypes(include=[np.number]).columns:
+    pred_df[col] = pred_df[col].replace(-9999, np.nan)
+
+# 删除所有包含 NaN 的行
+pred_df.dropna(inplace=True)
+
+# 从预测数据中选择 X 特征
+try:
+    pred_X = pred_df[X_train.columns]
+except KeyError as e:
+    print(f"错误：预测数据集中缺少某些特征列。缺失列：{e}")
+    print("预测数据集的列名：", pred_df.columns.tolist())
+    pred_X = pred_df
+
+# 初始化预测结果 DataFrame
+all_preds = pd.DataFrame(index=pred_X.index)
+
+# 循环遍历每个模型，获取预测概率并绘制散点图
+for name, model in trained.items():
+    try:
+        # 获取预测概率
+        all_preds[f"{name}_prob"] = model.predict_proba(pred_X)[:, 1]
+        y_pred_prob = all_preds[f"{name}_prob"]
+
+        # 检查是否有坐标列
+        if 'X' in pred_df.columns and 'Y' in pred_df.columns:
+            # 绘制预测散点图
+            plt.figure(figsize=(12, 10))
+            scatter = plt.scatter(pred_df['X'], pred_df['Y'], c=y_pred_prob, cmap='viridis', s=20, vmin=0.0, vmax=1.0)
+            plt.colorbar(scatter, label='Prediction Probability')
+            plt.title(f'{name} Prediction Probability Distribution')
+            plt.xlabel('X Coordinate')
+            plt.ylabel('Y Coordinate')
+            plt.axis('equal')
+            plt.tight_layout()
+
+            # 保存图像
+            plt.savefig(os.path.join(desktop1, f'{name}_prediction_plot.png'), dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"✅ {name} 预测图已保存")
+        else:
+            print(f"❌ 预测数据集中缺少坐标列，无法绘制 {name} 的预测图")
+            
+    except Exception as e:
+        print(f"❌ {name} 预测失败: {e}")
+
+# 保存所有模型的预测结果
+if 'X' in pred_df.columns and 'Y' in pred_df.columns:
+    all_preds['X'] = pred_df['X'].values
+    all_preds['Y'] = pred_df['Y'].values
+
+all_preds.to_csv(os.path.join(desktop1, 'all_model_predictions.csv'), index=False)
+print(f"✅ 预测结果已保存至：{os.path.join(desktop1, 'all_model_predictions.csv')}")
+
+print("🎉 所有任务完成！")
